@@ -479,6 +479,80 @@ class ReservationRenewalView(BaseModel):
     created_at: datetime
 
 
+class ReservationAdjustmentCreate(BaseModel):
+    """Replace a granted, non-expired reservation's locked (epsilon, delta).
+
+    The new values must be legal amounts (same constraints as at creation);
+    the reservation's ``ttl_seconds`` and expiry instant stay untouched.  The
+    swap is admitted only if the joint RDP composition with every
+    non-reversed granted request and every other non-expired reservation
+    still fits the dataset's epsilon cap; otherwise the attempt is recorded
+    as rejected and the reservation keeps its previous amount.
+    """
+
+    adjustment_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        examples=["adj-20260925-0001"],
+        description="Client-generated idempotency key; unique per dataset.",
+    )
+    epsilon: float = Field(..., gt=0.0, le=1_000.0, examples=[0.3])
+    delta: float = Field(
+        ...,
+        ge=0.0,
+        lt=1.0,
+        examples=[1e-8],
+        description="New reserved per-analysis delta; use 0 for pure "
+        "epsilon-DP.",
+    )
+
+    _eps_finite = _finite("epsilon")
+    _delta_finite = _finite("delta")
+
+    @field_validator("adjustment_id")
+    @classmethod
+    def _valid_id(cls, v: str) -> str:
+        if not _DATASET_ID_PATTERN.fullmatch(v):
+            raise ValueError(
+                "may contain only letters, digits, '.', '_' and '-'"
+            )
+        return v
+
+
+class ReservationAdjustmentView(BaseModel):
+    """Immutable record of one reservation amount adjustment.
+
+    ``epsilon_before`` / ``delta_before`` are the reservation's amounts just
+    before the attempt, ``epsilon_after`` / ``delta_after`` the requested new
+    amounts (kept only when ``status`` is ``adjusted``; a rejected attempt
+    leaves the reservation at the before amounts).  ``epsilon_committed_*``
+    are the composed ledger occupancies (non-reversed granted requests plus
+    non-expired reservations) evaluated with the old vs. the new amount.
+    Replaying the same ``(dataset_id, adjustment_id)`` with the same payload
+    returns this stored record with ``idempotent_replay = true`` without
+    adjusting again.
+    """
+
+    adjustment_id: str
+    dataset_id: str
+    reservation_id: str
+    epsilon_before: float
+    delta_before: float
+    epsilon_after: float
+    delta_after: float
+    allowed: bool
+    status: Literal["adjusted", "rejected"]
+    reason: Optional[str] = None
+    epsilon_cap: float
+    epsilon_committed_before: float
+    epsilon_committed_after: float
+    epsilon_remaining: float
+    rdp_best_order: float
+    idempotent_replay: bool = False
+    created_at: datetime
+
+
 class ForecastSnapshot(BaseModel):
     """Budget state for one set of still-valid reservations.
 

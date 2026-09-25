@@ -22,6 +22,8 @@ from .schemas import (
     DatasetRegister,
     ReleaseForecast,
     RequestList,
+    ReservationAdjustmentCreate,
+    ReservationAdjustmentView,
     ReversalCreate,
     ReversalList,
     ReversalPlanRequest,
@@ -96,7 +98,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Differential-Privacy Budget Ledger",
-    version="1.10.0",
+    version="1.11.0",
     lifespan=lifespan,
     description=(
         "Register epsilon/delta caps per dataset and submit analysis "
@@ -117,8 +119,21 @@ app = FastAPI(
         "one write transaction that stores an immutable renewal record, "
         "leaving the reserved amount and original ttl_seconds unchanged and "
         "occupying no extra budget; same-payload replays return the first "
-        "renewal's before/after expiry instants.  A read-only release "
-        "forecast simulates future TTL expiries up to a "
+        "renewal's before/after expiry instants.  A granted, not-yet-expired "
+        "reservation can also have its locked amount adjusted: a "
+        "dataset-unique adjustment_id and new legal epsilon/delta values "
+        "replace the old amount in one write transaction, jointly composed "
+        "with non-reversed granted requests and the other non-expired "
+        "reservations under the same RDP accounting; an over-cap attempt is "
+        "recorded as rejected and leaves the reservation at its previous "
+        "amount.  The first verdict and amount snapshots are stored per "
+        "(dataset_id, adjustment_id) -- same-payload replays return them, a "
+        "different payload on that id is a 409, and terminal or expired "
+        "reservations accept no new adjustment.  After a successful "
+        "adjustment, confirmation, budget queries and the release forecast "
+        "all use the new amount, while an idempotent replay of the original "
+        "reservation creation is still matched against the creation "
+        "payload.  A read-only release forecast simulates future TTL expiries up to a "
         "caller-supplied UTC deadline without changing any reservation or "
         "database state.  Epsilon cap can also be transferred between two "
         "registered datasets in one atomic, idempotent transaction: the source "
@@ -249,6 +264,23 @@ async def _renewal_conflict(_: Request, exc: db.RenewalConflict) -> JSONResponse
             "detail": (
                 "renewal_id was already used for a different renewal payload "
                 "(reservation or extend_seconds differs)"
+            ),
+        },
+    )
+
+
+@app.exception_handler(db.AdjustmentConflict)
+async def _adjustment_conflict(
+    _: Request, exc: db.AdjustmentConflict
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content={
+            "error": "adjustment_id_conflict",
+            "adjustment_id": exc.args[0],
+            "detail": (
+                "adjustment_id was already used for a different adjustment "
+                "payload (reservation or epsilon/delta differs)"
             ),
         },
     )
@@ -618,6 +650,25 @@ async def create_reservation_renewal(
     payload: ReservationRenewalCreate,
 ):
     view, http_status = await ledger.renew_reservation(
+        dataset_id, reservation_id, payload
+    )
+    return JSONResponse(status_code=http_status, content=view)
+
+
+@app.post(
+    "/datasets/{dataset_id}/reservations/{reservation_id}/adjustments",
+    response_model=ReservationAdjustmentView,
+    status_code=status.HTTP_201_CREATED,
+    tags=["reservations"],
+    summary="Adjust a granted reservation's amount (idempotent per "
+    "adjustment_id)",
+)
+async def create_reservation_adjustment(
+    dataset_id: DATASET_ID,
+    reservation_id: RESERVATION_ID,
+    payload: ReservationAdjustmentCreate,
+):
+    view, http_status = await ledger.adjust_reservation(
         dataset_id, reservation_id, payload
     )
     return JSONResponse(status_code=http_status, content=view)

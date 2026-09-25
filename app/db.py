@@ -227,6 +227,56 @@ CREATE INDEX IF NOT EXISTS idx_renewals_dataset
     ON reservation_renewals (dataset_id, id);
 """
 
+# Version 7: reservation amount adjustments.  A row is the immutable audit
+# record of one POST .../reservations/{reservation_id}/adjustments call
+# (idempotency key ``(dataset_id, adjustment_id)``): a granted, non-expired
+# reservation's locked ``(epsilon, delta)`` is replaced by the new legal values
+# inside the same write transaction, provided the resulting joint composition
+# (non-reversed granted requests + every other non-expired reservation + the
+# new amount under the existing RDP rules) still fits epsilon_cap; otherwise
+# the attempt is stored as rejected and the reservation row keeps its old
+# amount.  Replays return the stored verdict and amount snapshots.
+#
+# The reservations table additionally gains immutable ``created_epsilon`` /
+# ``created_delta`` columns carrying the payload admitted at creation: the
+# idempotency check on POST /reservations keeps matching the *creation*
+# payload after later adjustments, while the live ``epsilon`` / ``delta``
+# columns always hold the currently effective (possibly adjusted) amount used
+# by confirmation, budget queries, forecasts and every admission check.
+SCHEMA_V7 = """
+CREATE TABLE IF NOT EXISTS reservation_adjustments (
+    id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+    dataset_id                TEXT NOT NULL,
+    reservation_id            TEXT NOT NULL,
+    adjustment_id             TEXT NOT NULL,
+    epsilon_before            REAL NOT NULL,
+    delta_before              REAL NOT NULL,
+    epsilon_after             REAL NOT NULL,
+    delta_after               REAL NOT NULL,
+    status                    TEXT NOT NULL CHECK (status IN (
+                                  'adjusted', 'rejected'
+                              )),
+    reason                    TEXT,
+    epsilon_cap               REAL NOT NULL,
+    epsilon_committed_before  REAL NOT NULL,
+    epsilon_committed_after   REAL NOT NULL,
+    rdp_best_order            REAL NOT NULL,
+    created_at                TEXT NOT NULL,
+    UNIQUE (dataset_id, adjustment_id),
+    FOREIGN KEY (dataset_id, reservation_id)
+        REFERENCES reservations (dataset_id, reservation_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_adjustments_dataset
+    ON reservation_adjustments (dataset_id, id);
+
+ALTER TABLE reservations ADD COLUMN created_epsilon REAL;
+ALTER TABLE reservations ADD COLUMN created_delta REAL;
+UPDATE reservations
+    SET created_epsilon = epsilon, created_delta = delta
+    WHERE created_epsilon IS NULL OR created_delta IS NULL;
+"""
+
 MIGRATIONS: dict[int, str] = {
     1: SCHEMA_V1,
     2: SCHEMA_V2,
@@ -234,6 +284,7 @@ MIGRATIONS: dict[int, str] = {
     4: SCHEMA_V4,
     5: SCHEMA_V5,
     6: SCHEMA_V6,
+    7: SCHEMA_V7,
 }
 LATEST_VERSION = max(MIGRATIONS)
 
@@ -270,6 +321,10 @@ class ReservationStateConflict(Exception):
 
 class RenewalConflict(Exception):
     """Same renewal_id reused with a different payload (HTTP 409)."""
+
+
+class AdjustmentConflict(Exception):
+    """Same adjustment_id reused with a different payload (HTTP 409)."""
 
 
 class TransferConflict(Exception):
@@ -410,7 +465,8 @@ async def require_dataset(db: aiosqlite.Connection, dataset_id: str) -> aiosqlit
 _RESERVATION_SELECT = (
     "SELECT dataset_id, reservation_id, epsilon, delta, ttl_seconds, status, "
     "reason, epsilon_before, epsilon_after, rdp_best_order, created_at, "
-    "expires_at, expired_at, confirmed_at, confirmed_request_id, released_at "
+    "expires_at, expired_at, confirmed_at, confirmed_request_id, released_at, "
+    "created_epsilon, created_delta "
     "FROM reservations WHERE dataset_id = ?"
 )
 
@@ -590,15 +646,23 @@ async def insert_reservation(
     created_at: str,
     expires_at: Optional[str],
 ) -> None:
+    """Insert a reservation; the creation payload is stored immutably.
+
+    ``epsilon`` / ``delta`` are the live amounts (later adjustments rewrite
+    them); ``created_epsilon`` / ``created_delta`` freeze the admitted
+    creation payload so idempotent replays of POST /reservations keep
+    matching it after adjustments.
+    """
     await db.execute(
         "INSERT INTO reservations "
         "(dataset_id, reservation_id, epsilon, delta, ttl_seconds, status, "
         "reason, epsilon_before, epsilon_after, rdp_best_order, created_at, "
-        "expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "expires_at, created_epsilon, created_delta) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             dataset_id, reservation_id, epsilon, delta, ttl_seconds, status,
             reason, epsilon_before, epsilon_after, rdp_best_order, created_at,
-            expires_at,
+            expires_at, epsilon, delta,
         ),
     )
 
@@ -744,6 +808,83 @@ async def get_reservation_renewal(
     async with db.execute(
         f"{_RENEWAL_SELECT} WHERE dataset_id = ? AND renewal_id = ?",
         (dataset_id, renewal_id),
+    ) as cur:
+        return await cur.fetchone()
+
+
+# ------------------------------------------------------- amount adjustments --
+
+
+async def update_reservation_amount(
+    db: aiosqlite.Connection,
+    *,
+    dataset_id: str,
+    reservation_id: str,
+    epsilon: float,
+    delta: float,
+) -> None:
+    """Replace a granted reservation's live (epsilon, delta) amount.
+
+    Only the live amount columns move; the immutable ``created_epsilon`` /
+    ``created_delta`` creation payload, ``ttl_seconds`` and every timestamp
+    stay untouched, so creation-time idempotency and the TTL lifecycle are
+    unaffected.
+    """
+    await db.execute(
+        "UPDATE reservations SET epsilon = ?, delta = ? "
+        "WHERE dataset_id = ? AND reservation_id = ? AND status = 'granted'",
+        (epsilon, delta, dataset_id, reservation_id),
+    )
+
+
+async def insert_reservation_adjustment(
+    db: aiosqlite.Connection,
+    *,
+    dataset_id: str,
+    reservation_id: str,
+    adjustment_id: str,
+    epsilon_before: float,
+    delta_before: float,
+    epsilon_after: float,
+    delta_after: float,
+    status: str,
+    reason: Optional[str],
+    epsilon_cap: float,
+    epsilon_committed_before: float,
+    epsilon_committed_after: float,
+    rdp_best_order: float,
+    created_at: str,
+) -> None:
+    await db.execute(
+        "INSERT INTO reservation_adjustments "
+        "(dataset_id, reservation_id, adjustment_id, epsilon_before, "
+        "delta_before, epsilon_after, delta_after, status, reason, "
+        "epsilon_cap, epsilon_committed_before, epsilon_committed_after, "
+        "rdp_best_order, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            dataset_id, reservation_id, adjustment_id, epsilon_before,
+            delta_before, epsilon_after, delta_after, status, reason,
+            epsilon_cap, epsilon_committed_before, epsilon_committed_after,
+            rdp_best_order, created_at,
+        ),
+    )
+
+
+_ADJUSTMENT_SELECT = (
+    "SELECT dataset_id, reservation_id, adjustment_id, epsilon_before, "
+    "delta_before, epsilon_after, delta_after, status, reason, epsilon_cap, "
+    "epsilon_committed_before, epsilon_committed_after, rdp_best_order, "
+    "created_at FROM reservation_adjustments"
+)
+
+
+async def get_reservation_adjustment(
+    db: aiosqlite.Connection, dataset_id: str, adjustment_id: str
+) -> Optional[aiosqlite.Row]:
+    async with db.execute(
+        f"{_ADJUSTMENT_SELECT} WHERE dataset_id = ? AND adjustment_id = ?",
+        (dataset_id, adjustment_id),
     ) as cur:
         return await cur.fetchone()
 

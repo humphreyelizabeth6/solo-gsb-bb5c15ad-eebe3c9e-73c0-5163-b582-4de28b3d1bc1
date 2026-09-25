@@ -19,7 +19,14 @@ Rényi DP（RDP）orders 上累加各次申请的组合消耗，在并发申请�
 `extend_seconds` 把到期时刻向后延长（新到期时刻距创建时刻不得超过 90 天），
 金额与原始 `ttl_seconds` 不变、不重复占额，并在同一个 SQLite 写事务内保存
 **不可变续期记录**；同负载重放返回首次续期的前后到期时刻，异负载返回
-`409`，已到期或终态预留的新续期返回 `409`。还提供**只读**的预算释放预测接口：
+`409`，已到期或终态预留的新续期返回 `409`。未到期且仍为 `granted` 的预留
+还可**调整额度（adjustment）**：以数据集内幂等键 `adjustment_id` 把锁定的
+`epsilon` / `delta` 替换为新的合法数值，在同一个 SQLite 写事务内与未冲正
+申请及其他有效预留按现有 RDP 口径联合核算，超 cap 则拒绝并**保持原额度**
+（拒绝同样留痕）；同键同负载重放首次裁定与额度快照，异负载返回 `409`，
+终态或过期预留不得新调整。调整成功后确认、预算查询与释放预测都按新额度
+核算，而原预留创建请求的幂等重放仍按创建时负载判定。还提供**只读**的预算
+释放预测接口：
 给定一个未来 UTC 截止时间，按 `expires_at` 分组模拟预留到期并逐刻重算
 剩余 epsilon 与活动预留数，全程不改写任何预留状态或数据库。
 
@@ -208,6 +215,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/datasets/{dataset_id}/reservations/{reservation_id}/confirm` | 确认预留 → 分析申请（幂等） |
 | `POST` | `/datasets/{dataset_id}/reservations/{reservation_id}/release` | 释放预留（幂等） |
 | `POST` | `/datasets/{dataset_id}/reservations/{reservation_id}/renewals` | 续期预留：把未到期 granted 预留的到期时刻后移（按 `renewal_id` 幂等） |
+| `POST` | `/datasets/{dataset_id}/reservations/{reservation_id}/adjustments` | 调整预留额度：把未到期 granted 预留的 `(epsilon, delta)` 替换为新值（按 `adjustment_id` 幂等，超 cap 拒绝且保持原额度） |
 | `GET` | `/datasets/{dataset_id}/budget/release-forecast?deadline=...` | **只读**模拟截止时间前的预留到期释放 |
 | `POST` | `/budget-transfers` | 在两个数据集间原子转拨 epsilon 上限（幂等） |
 | `GET` | `/health` | 健康检查 |
@@ -507,7 +515,10 @@ curl -X POST http://localhost:8000/datasets/sales-2026/reservations \
   注意 TTL **不会**因重放而延长（沿用首次的 `created_at`/`expires_at`）；
 * 相同 `reservation_id` 但 `epsilon` / `delta` / `ttl_seconds` 任一不同：
   返回 `409 reservation_id_conflict`；
-* 被拒绝的预留同样幂等。
+* 被拒绝的预留同样幂等；
+* 负载比对始终以**创建时**提交的 `epsilon` / `delta` 为准：即使预留此后
+  被额度调整（见 4.12）改写了当前生效额度，用创建时负载重放仍返回 `200`
+  幂等结果。
 
 ### 4.9 确认预留（转为分析申请）
 
@@ -606,10 +617,91 @@ curl -X POST \
 * `extend_seconds` 非正整数 / 超过 90 天、`renewal_id` 缺失或含非法字符等
   → `422`。
 
-### 4.12 TTL 过期
+### 4.12 调整预留额度（adjustment）
+
+对**仍为 `granted` 且未到期**的预留，可以在不改变 `ttl_seconds` 与到期时刻的
+前提下，把锁定的 `(epsilon, delta)` 替换为新的合法数值：
+
+```bash
+curl -X POST \
+  http://localhost:8000/datasets/sales-2026/reservations/res-20260923-0001/adjustments \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "adjustment_id": "adj-20260925-0001",
+    "epsilon": 0.3,
+    "delta": 1e-8
+  }'
+```
+
+请求体：
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `adjustment_id` | string | 必填，客户端生成的幂等键（字母/数字/`.`/`_`/`-`，1–200），**同一数据集内唯一** |
+| `epsilon` | float | 必填，`> 0, ≤ 1000`，新的预留 epsilon |
+| `delta` | float | 必填，`>= 0, < 1`；`0` 表示纯 ε-DP |
+
+服务在**同一个 SQLite 写事务**内完成「惰性过期清扫 → 状态校验 → 以新额度替换
+旧额度后与**全部未冲正已授权申请 + 其他未到期有效预留**按现有 RDP 口径联合
+组合 → 判定 → 更新预留行并写入不可变调整记录」。投影不超 `epsilon_cap` 才
+生效，返回 `201`：
+
+```json
+{
+  "adjustment_id": "adj-20260925-0001",
+  "dataset_id": "sales-2026",
+  "reservation_id": "res-20260923-0001",
+  "epsilon_before": 0.2,
+  "delta_before": 1e-8,
+  "epsilon_after": 0.3,
+  "delta_after": 1e-8,
+  "allowed": true,
+  "status": "adjusted",
+  "reason": null,
+  "epsilon_cap": 1.0,
+  "epsilon_committed_before": 0.203936,
+  "epsilon_committed_after": 0.305871,
+  "epsilon_remaining": 0.694129,
+  "rdp_best_order": 8192.0,
+  "idempotent_replay": false,
+  "created_at": "2026-09-25T01:10:16.563790+00:00"
+}
+```
+
+* `epsilon_before` / `delta_before` 为调整前额度，`epsilon_after` /
+  `delta_after` 为本次请求的新额度；`epsilon_committed_before` /
+  `epsilon_committed_after` 为旧 / 新额度下整个数据集的组合占用快照，
+  `epsilon_remaining = epsilon_cap − epsilon_committed_after`（不为负）；
+* **超 cap 拒绝**：仍返回 `201`（正常受理留痕），但 `allowed=false,
+  status="rejected"`，`reason` 说明投影消耗，预留**保持原额度**、预算视图
+  不变，`epsilon_committed_after == epsilon_committed_before`；被拒绝的
+  `adjustment_id` 同样幂等留存，不妨碍后续用新 `adjustment_id` 合法调整；
+* 已到期（含被惰性清扫）或终态（`confirmed` / `released` / `rejected` /
+  `expired`）的预留**不能新调整** → `409`（错误码分别为
+  `reservation_confirmed` / `reservation_released` / `reservation_rejected` /
+  `reservation_expired`）；预留不存在 → `404 reservation_not_found`，
+  数据集不存在 → `404 dataset_not_found`；
+* 相同 `(dataset_id, adjustment_id)` + **相同负载**（同一 `reservation_id`
+  与相同 `epsilon` / `delta`）重试：返回 `200` 与**首次裁定及额度快照**，
+  `idempotent_replay=true`，额度只替换一次——即使预留此后已过期或已确认也
+  照样回放首次记录；相同 `adjustment_id` 但负载不同（`epsilon` / `delta`
+  不同或指向本数据集另一预留）→ `409 adjustment_id_conflict`，不产生任何
+  变更；`adjustment_id` 只在本数据集内唯一，其他数据集可复用；
+* 调整成功后，**确认（confirm）、预算查询（budget）与只读释放预测
+  （release-forecast）都按新额度核算**，新申请 / 新预留 / 转拨 / 各只读
+  试算同样按新额度计入；预留行的 `epsilon` / `delta` 即当前生效额度，而
+  创建时的 `epsilon_before` / `epsilon_after` / `created_at` / `expires_at`
+  等历史字段保持不变；
+* **原预留创建请求的幂等重放仍按创建时负载判定**：调整后用创建时的
+  `epsilon` / `delta` / `ttl_seconds` 重放 `POST …/reservations` 仍返回
+  `200` 幂等结果（不会变成 `409`，也不会再占额）；与创建负载不一致的
+  负载（哪怕恰好等于调整后的额度）仍返回 `409 reservation_id_conflict`；
+* `adjustment_id` 缺失或含非法字符、`epsilon` / `delta` 缺失或越界等 → `422`。
+
+### 4.13 TTL 过期
 
 * 预留不会被后台线程主动删除；任何接触预算的路径（查询预留/预算、新建
-  申请或预留、确认、释放、续期）都会在同一临界区内把 `expires_at ≤ now` 的
+  申请或预留、确认、释放、续期、调整）都会在同一临界区内把 `expires_at ≤ now` 的
   `granted` 预留惰性标记为 `expired`（记录 `expired_at`），之后它们**不再
   占用额度**——因此过期后新的申请/预留可以使用这部分额度；
 * 过期是终态：过期预留不能再确认（`409 reservation_expired`），对其调用
@@ -618,7 +710,7 @@ curl -X POST \
   `created_at` / `expires_at` / `expired_at` / `confirmed_at` /
   `released_at` 时间戳，便于审计。
 
-### 4.13 预算释放预测（只读）
+### 4.14 预算释放预测（只读）
 
 在不触碰任何预留状态的前提下，预测到某个未来 UTC 时刻为止，TTL 到期会按
 什么节奏归还多少预算：
@@ -694,7 +786,7 @@ curl -G http://localhost:8000/datasets/sales-2026/budget/release-forecast \
 * 无时区信息的裸时间 → `422 invalid_forecast_deadline`；
 * `deadline` 不晚于当前时间 → `422 invalid_forecast_deadline`。
 
-### 4.14 epsilon 上限转拨（budget transfer）
+### 4.15 epsilon 上限转拨（budget transfer）
 
 在两个已登记数据集之间转拨 epsilon 上限，**delta_cap 与所有已入账申请、
 预留都不改变**：
@@ -780,7 +872,7 @@ epsilon_committed`（成功时为转拨后的新 cap，拒绝时为原 cap）。
 完成；并发转拨之间、转拨与申请 / 预留之间无论怎样交错，预算都不会透支
 （来源新 cap 永远覆盖其占用），且两端 epsilon_cap 之和守恒。
 
-### 4.15 冲正已授权申请（reversal）
+### 4.16 冲正已授权申请（reversal）
 
 当一次已授权（直接 granted，或由预留 confirmed）的分析申请需要撤销时，可
 以对其发起**冲正**。冲正**不删除、不改写**原申请：`requests` 中的原始裁定
@@ -873,7 +965,7 @@ curl -X POST \
   `reversal_reason`、`reversed_at` 字段；未冲正的申请这些字段为
   `false` / `null`，原裁定字段保持为受理当时的历史值。
 
-### 4.16 候选组合试算（selection plan，只读）
+### 4.17 候选组合试算（selection plan，只读）
 
 在**不创建任何申请 / 预留 / 裁定记录**的前提下，对 1～12 个候选分析项穷举
 可行子集，返回当前账本下总 `value` 最大的组合。占用基线与正式准入完全一致：
@@ -960,7 +1052,7 @@ curl -X POST http://localhost:8000/datasets/sales-2026/selection-plans \
 * 候选数为 0 或超过 12、`candidate_id` 重复或为空、`epsilon` / `delta` 越界、
   `value` 非正整数（含小数）等 → `422`。
 
-### 4.17 隐私成本归因（cost attribution，只读）
+### 4.18 隐私成本归因（cost attribution，只读）
 
 在**不创建任何记录、不改变预留状态**的前提下，把一组**已授权且未冲正**申请
 「整组选入」造成的 epsilon 增量，按标准 **Shapley 值**分摊给组内每个申请。
@@ -1058,7 +1150,7 @@ Shapley 权重保证 **`Σ_i phi_i = V(N) − V(∅) = epsilon_increment`**（�
 * 数据集不存在 → `404 dataset_not_found`；
 * `request_ids` 为空或超过 10 个、存在重复 ID、ID 为空或超长 → `422`。
 
-### 4.18 重复工作负载容量试算（repeat-run trial，只读）
+### 4.19 重复工作负载容量试算（repeat-run trial，只读）
 
 在**不创建任何申请 / 预留 / 裁定记录**的前提下，把一组固定分析项当作一次
 「工作负载运行」，求当前账本下最多能完整重复运行多少次。占用基线与正式准入
@@ -1153,7 +1245,7 @@ curl -X POST http://localhost:8000/datasets/sales-2026/repeat-run-trials \
 * 分析项为 0 个或超过 5 个、`max_runs` 不在 `1..100000`（含小数）、
   `epsilon` / `delta` 越界等 → `422`。
 
-### 4.19 冲正方案试算（reversal plan，只读）
+### 4.20 冲正方案试算（reversal plan，只读）
 
 在**不执行任何冲正或申请、不改变预留状态**的前提下，为一个**待申请分析项**
 寻找「最少冲正哪几条已授权申请才能放得下」的方案。基线口径与正式准入完全一致：
@@ -1316,6 +1408,14 @@ EPSILON_TOLERANCE` 的子集为可行。在全部可行子集中按以下顺序�
     「冲正条数最少 → 冲正后账本投影占用最大 → `request_id` 升序列表字典序
     最小」裁定；不执行冲正或申请、不做惰性清扫，重复调用按最新账本重算。
 
+11. 额度调整（adjustment）在同一个写事务内把目标预留的 `(epsilon, delta)`
+    从组合中替换为新值再投影：「全部未冲正已授权申请 ∪ 其他未到期有效
+    预留 ∪ {新额度}」的投影不超 `epsilon_cap + EPSILON_TOLERANCE` 才生效
+    （预留行的 `epsilon` / `delta` 更新为新值），否则预留保持原额度、仅留
+    一条 `rejected` 调整记录；`ttl_seconds`、到期时刻与创建时负载
+    （`created_epsilon` / `created_delta`）始终不变，确认、预算查询、释放
+    预测与所有准入 / 试算路径此后都按新额度核算。
+
 特殊情形：
 
 * 全部已授权申请与有效预留都是纯 ε-DP 时，直接采用精确的基本组合
@@ -1332,8 +1432,9 @@ EPSILON_TOLERANCE` 的子集为可行。在全部可行子集中按以下顺序�
 
 ## 6. 并发与原子性
 
-* 每个写操作（登记、提交申请、提交原子分析批次、创建/确认/释放/续期预留、
-  epsilon 上限转拨、申请冲正）在进程内 `asyncio.Lock` 保护下打开一个 SQLite
+* 每个写操作（登记、提交申请、提交原子分析批次、创建/确认/释放/续期/调整
+  预留、epsilon 上限转拨、申请冲正）在进程内 `asyncio.Lock` 保护下打开一个
+  SQLite
   **`BEGIN IMMEDIATE`** 事务：「惰性过期清理 → 查重/查状态 → 重算（未冲正
   已授权申请 + 有效预留）组合消耗 → 判定 → 插入/更新记录」在同一个事务
   临界区内完成，并发操作被串行化，**申请与预留无论怎样并发交错，已授权
@@ -1360,10 +1461,17 @@ EPSILON_TOLERANCE` 的子集为可行。在全部可行子集中按以下顺序�
   reservation_renewals 记录」：续期与确认 / 释放 / 过期清扫并发交错时，
   到期时刻的移动与状态判定始终一致，同一 `(dataset_id, renewal_id)` 最多
   生效一次（`UNIQUE` 约束兜底），续期本身不重算组合、不重复占额；
+* 预留的额度调整在该临界区内一次完成「`adjustment_id` 查重 → 惰性过期
+  清扫与状态校验 → 以新额度替换旧额度后重算（未冲正已授权申请 + 其他
+  有效预留）组合消耗 → 判定 → 更新预留行并写入不可变
+  reservation_adjustments 记录」：调整与确认 / 释放 / 续期 / 过期清扫 /
+  其他调整并发交错时，额度的替换与判定始终一致，组合消耗始终不超 cap，
+  同一 `(dataset_id, adjustment_id)` 最多生效一次（`UNIQUE` 约束兜底），
+  超 cap 的调整只留 `rejected` 记录、预留保持原额度；
 * SQLite 启用 **WAL** 与 `busy_timeout`：读不阻塞写，写冲突排队等待
   而非立即报错；`(dataset_id, request_id)`、`(dataset_id, reservation_id)`、
-  `(dataset_id, batch_id)` 与 `(dataset_id, renewal_id)` 上各有 `UNIQUE`
-  约束作为最终防线；
+  `(dataset_id, batch_id)`、`(dataset_id, renewal_id)` 与
+  `(dataset_id, adjustment_id)` 上各有 `UNIQUE` 约束作为最终防线；
 * 拒绝不写入任何消耗，只留一条 `rejected` 记录，因此并发请求/预留中
   “先到先得、额满即拒”；
 * TTL 过期为**惰性**处理：任何读写路径进入临界区时先把到期预留标记为
@@ -1399,6 +1507,7 @@ Schema 由 SQLite 的 `PRAGMA user_version` 管理，服务启动时自动顺序
 | 4 | 新增 `request_reversals` 表（全局唯一 `reversal_id`、目标申请、原因、冲正前后组合 epsilon 快照与时间戳；`(dataset_id, request_id)` 唯一）。已有 granted 申请在显式冲正前核算口径不变 |
 | 5 | 新增 `request_batches` / `request_batch_items` 表（`(dataset_id, batch_id)` 唯一、按提交顺序保存各项及累计组合快照；granted 批次的各项同时写入 `requests`，rejected 批次不写申请行）。已有申请 / 预留 / 冲正记录原样保留，核算口径不变 |
 | 6 | 新增 `reservation_renewals` 表（`(dataset_id, renewal_id)` 唯一、目标预留、延长秒数、续期前后到期时刻与时间戳）。已有数据集、申请与预留记录原样保留，核算口径不变 |
+| 7 | 新增 `reservation_adjustments` 表（`(dataset_id, adjustment_id)` 唯一、目标预留、调整前后额度、状态、前后组合占用快照与时间戳），并为 `reservations` 增加 `created_epsilon` / `created_delta` 列（按既有 `epsilon` / `delta` 回填）以在调整后仍按创建时负载判定创建幂等。已有数据集、申请与预留记录原样保留，核算口径不变 |
 
 旧版本数据库（无 `user_version`，即 v0）启动时会先确保 v1 表存在再顺序升级
 到最新版本，已有数据集、申请与预留记录原样保留。
@@ -1432,6 +1541,20 @@ rejected / expired 终态 409、90 天视野上限（恰好到界通过、超一
 的预留仍在新到期时刻才被惰性清扫、20 路重复 `renewal_id` 并发仅后移一次、
 10 路不同 `renewal_id` 并发全部生效，以及从 v5 schema 启动时自动迁移出
 `reservation_renewals` 表。
+
+额度调整相关测试另覆盖：调整替换额度且 `ttl_seconds` / 到期时刻 / 创建时
+快照不变、预算视图按新额度核算（并用 `rdp.py` 独立组合交叉校验前后组合
+占用）、链式调整逐步替换、下调释放预算、改为纯 ε-DP 走精确加法、与未冲正
+申请及其他有效预留联合核算、超 cap 拒绝且预留保持原额度（预算不变、拒绝
+记录幂等留存、不妨碍后续合法调整）、同负载重放返回首次裁定与额度快照
+（含预留已过期后的重放）且只替换一次、异负载 / 跨预留同键 409、
+`adjustment_id` 按数据集隔离、缺失数据集 / 预留 404、confirmed / released /
+rejected / expired 终态 409、负载非法 422、确认按新额度转申请且不双重
+扣减、只读释放预测按新额度核算、调整后新申请准入按新额度判定、原预留
+创建请求按创建时负载重放仍为 200（调整后额度负载反而 409）、20 路重复
+`adjustment_id` 并发仅替换一次、10 路不同 `adjustment_id` 并发全部生效且
+不超 cap，以及从 v6 schema 启动时自动迁移出 `reservation_adjustments` 表并
+回填 `created_epsilon` / `created_delta`。
 
 只读释放预测测试覆盖：同刻到期分组移除与逐刻 RDP 重算（并用 `rdp.py`
 独立核算交叉校验）、恰好在截止时刻到期的边界、早于任何到期的预测区间、
