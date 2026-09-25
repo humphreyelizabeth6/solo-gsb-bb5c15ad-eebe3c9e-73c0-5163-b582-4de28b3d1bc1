@@ -227,6 +227,54 @@ CREATE INDEX IF NOT EXISTS idx_renewals_dataset
     ON reservation_renewals (dataset_id, id);
 """
 
+# Version 7: reservation quota adjustments.  A row is the immutable audit
+# record of one POST .../reservations/{reservation_id}/adjustments call
+# (idempotency key ``(dataset_id, adjustment_id)``): a granted, non-expired
+# reservation's live ``epsilon`` / ``delta`` are replaced by new legal values
+# inside the same write transaction, and every accounting path afterwards
+# composes the new quota.  ``original_epsilon`` / ``original_delta`` on the
+# reservation row freeze the creation-time payload, so replaying the original
+# reservation-creation request is still judged against what was created, not
+# the adjusted quota.  Rejected attempts (projected epsilon over the cap) are
+# stored too, with *_after == *_before: the live quota is demonstrably
+# untouched while the first verdict and its quota snapshots survive.
+SCHEMA_V7 = """
+ALTER TABLE reservations ADD COLUMN original_epsilon REAL;
+ALTER TABLE reservations ADD COLUMN original_delta REAL;
+UPDATE reservations
+   SET original_epsilon = epsilon,
+       original_delta = delta
+ WHERE original_epsilon IS NULL;
+
+CREATE TABLE IF NOT EXISTS reservation_adjustments (
+    id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+    dataset_id                TEXT NOT NULL,
+    reservation_id            TEXT NOT NULL,
+    adjustment_id             TEXT NOT NULL,
+    epsilon_before            REAL NOT NULL,
+    delta_before              REAL NOT NULL,
+    requested_epsilon         REAL NOT NULL,
+    requested_delta           REAL NOT NULL,
+    epsilon_after             REAL NOT NULL,
+    delta_after               REAL NOT NULL,
+    status                    TEXT NOT NULL CHECK (status IN (
+                                  'adjusted', 'rejected'
+                              )),
+    reason                    TEXT,
+    epsilon_cap               REAL NOT NULL,
+    epsilon_committed_before  REAL NOT NULL,
+    epsilon_committed_after   REAL NOT NULL,
+    rdp_best_order            REAL NOT NULL,
+    created_at                TEXT NOT NULL,
+    UNIQUE (dataset_id, adjustment_id),
+    FOREIGN KEY (dataset_id, reservation_id)
+        REFERENCES reservations (dataset_id, reservation_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_adjustments_dataset
+    ON reservation_adjustments (dataset_id, id);
+"""
+
 MIGRATIONS: dict[int, str] = {
     1: SCHEMA_V1,
     2: SCHEMA_V2,
@@ -234,6 +282,7 @@ MIGRATIONS: dict[int, str] = {
     4: SCHEMA_V4,
     5: SCHEMA_V5,
     6: SCHEMA_V6,
+    7: SCHEMA_V7,
 }
 LATEST_VERSION = max(MIGRATIONS)
 
@@ -270,6 +319,10 @@ class ReservationStateConflict(Exception):
 
 class RenewalConflict(Exception):
     """Same renewal_id reused with a different payload (HTTP 409)."""
+
+
+class AdjustmentConflict(Exception):
+    """Same adjustment_id reused with a different payload (HTTP 409)."""
 
 
 class TransferConflict(Exception):
@@ -408,7 +461,8 @@ async def require_dataset(db: aiosqlite.Connection, dataset_id: str) -> aiosqlit
 
 
 _RESERVATION_SELECT = (
-    "SELECT dataset_id, reservation_id, epsilon, delta, ttl_seconds, status, "
+    "SELECT dataset_id, reservation_id, epsilon, delta, "
+    "original_epsilon, original_delta, ttl_seconds, status, "
     "reason, epsilon_before, epsilon_after, rdp_best_order, created_at, "
     "expires_at, expired_at, confirmed_at, confirmed_request_id, released_at "
     "FROM reservations WHERE dataset_id = ?"
@@ -590,15 +644,18 @@ async def insert_reservation(
     created_at: str,
     expires_at: Optional[str],
 ) -> None:
+    # original_epsilon / original_delta freeze the creation-time payload; a
+    # later quota adjustment rewrites only the live epsilon / delta columns.
     await db.execute(
         "INSERT INTO reservations "
-        "(dataset_id, reservation_id, epsilon, delta, ttl_seconds, status, "
-        "reason, epsilon_before, epsilon_after, rdp_best_order, created_at, "
-        "expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "(dataset_id, reservation_id, epsilon, delta, original_epsilon, "
+        "original_delta, ttl_seconds, status, reason, epsilon_before, "
+        "epsilon_after, rdp_best_order, created_at, expires_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
-            dataset_id, reservation_id, epsilon, delta, ttl_seconds, status,
-            reason, epsilon_before, epsilon_after, rdp_best_order, created_at,
-            expires_at,
+            dataset_id, reservation_id, epsilon, delta, epsilon, delta,
+            ttl_seconds, status, reason, epsilon_before, epsilon_after,
+            rdp_best_order, created_at, expires_at,
         ),
     )
 
@@ -746,6 +803,93 @@ async def get_reservation_renewal(
         (dataset_id, renewal_id),
     ) as cur:
         return await cur.fetchone()
+
+
+# ------------------------------------------------------------ adjustments --
+
+
+_ADJUSTMENT_SELECT = (
+    "SELECT dataset_id, reservation_id, adjustment_id, epsilon_before, "
+    "delta_before, requested_epsilon, requested_delta, epsilon_after, "
+    "delta_after, status, reason, epsilon_cap, epsilon_committed_before, "
+    "epsilon_committed_after, rdp_best_order, created_at "
+    "FROM reservation_adjustments"
+)
+
+
+async def get_reservation_adjustment(
+    db: aiosqlite.Connection, dataset_id: str, adjustment_id: str
+) -> Optional[aiosqlite.Row]:
+    async with db.execute(
+        f"{_ADJUSTMENT_SELECT} WHERE dataset_id = ? AND adjustment_id = ?",
+        (dataset_id, adjustment_id),
+    ) as cur:
+        return await cur.fetchone()
+
+
+async def adjust_reservation_quota(
+    db: aiosqlite.Connection,
+    *,
+    dataset_id: str,
+    reservation_id: str,
+    epsilon: float,
+    delta: float,
+    epsilon_before: float,
+    epsilon_after: float,
+    rdp_best_order: float,
+) -> None:
+    """Replace a granted reservation's live quota inside the caller's tx.
+
+    Only the live ``epsilon`` / ``delta`` accounting columns and the
+    admission snapshots move; the creation-time ``original_epsilon`` /
+    ``original_delta`` (creation replay payload), ``ttl_seconds`` and the
+    expiry instant stay untouched.
+    """
+    await db.execute(
+        "UPDATE reservations SET epsilon = ?, delta = ?, "
+        "epsilon_before = ?, epsilon_after = ?, rdp_best_order = ? "
+        "WHERE dataset_id = ? AND reservation_id = ? AND status = 'granted'",
+        (
+            epsilon, delta, epsilon_before, epsilon_after, rdp_best_order,
+            dataset_id, reservation_id,
+        ),
+    )
+
+
+async def insert_reservation_adjustment(
+    db: aiosqlite.Connection,
+    *,
+    dataset_id: str,
+    reservation_id: str,
+    adjustment_id: str,
+    epsilon_before: float,
+    delta_before: float,
+    requested_epsilon: float,
+    requested_delta: float,
+    epsilon_after: float,
+    delta_after: float,
+    status: str,
+    reason: Optional[str],
+    epsilon_cap: float,
+    epsilon_committed_before: float,
+    epsilon_committed_after: float,
+    rdp_best_order: float,
+    created_at: str,
+) -> None:
+    await db.execute(
+        "INSERT INTO reservation_adjustments "
+        "(dataset_id, reservation_id, adjustment_id, epsilon_before, "
+        "delta_before, requested_epsilon, requested_delta, epsilon_after, "
+        "delta_after, status, reason, epsilon_cap, epsilon_committed_before, "
+        "epsilon_committed_after, rdp_best_order, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            dataset_id, reservation_id, adjustment_id, epsilon_before,
+            delta_before, requested_epsilon, requested_delta, epsilon_after,
+            delta_after, status, reason, epsilon_cap, epsilon_committed_before,
+            epsilon_committed_after, rdp_best_order, created_at,
+        ),
+    )
 
 
 # ------------------------------------------------------------ cap transfers --

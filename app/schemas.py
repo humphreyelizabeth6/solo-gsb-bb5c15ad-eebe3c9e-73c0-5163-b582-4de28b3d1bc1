@@ -479,6 +479,80 @@ class ReservationRenewalView(BaseModel):
     created_at: datetime
 
 
+class ReservationAdjustmentCreate(BaseModel):
+    """Replace a granted, non-expired reservation's epsilon/delta quota.
+
+    The reserved ``ttl_seconds`` and expiry instant are left untouched; only
+    the live ``epsilon`` / ``delta`` accounting values move, atomically under
+    the dataset cap.
+    """
+
+    adjustment_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        examples=["adj-20260925-0001"],
+        description="Client-generated idempotency key; unique per dataset.",
+    )
+    epsilon: float = Field(..., gt=0.0, le=1_000.0, examples=[0.1])
+    delta: float = Field(
+        ...,
+        ge=0.0,
+        lt=1.0,
+        examples=[1e-7],
+        description="New reserved delta; use 0 for pure epsilon-DP.",
+    )
+
+    _eps_finite = _finite("epsilon")
+    _delta_finite = _finite("delta")
+
+    @field_validator("adjustment_id")
+    @classmethod
+    def _valid_id(cls, v: str) -> str:
+        if not _DATASET_ID_PATTERN.fullmatch(v):
+            raise ValueError(
+                "may contain only letters, digits, '.', '_' and '-'"
+            )
+        return v
+
+
+class ReservationAdjustmentView(BaseModel):
+    """Immutable record of one reservation quota adjustment.
+
+    A refused adjustment is returned with HTTP 201 and ``allowed = false``:
+    the attempt was processed atomically and recorded, but the reservation's
+    quota stayed unchanged (the ``*_after`` quota fields then equal the
+    ``*_before`` ones).  Replaying the same ``(dataset_id, adjustment_id)``
+    with the same payload returns this stored record with
+    ``idempotent_replay = true`` without adjusting again.
+    """
+
+    adjustment_id: str
+    dataset_id: str
+    reservation_id: str
+    # Live quota in effect just before the attempt.
+    epsilon_before: float
+    delta_before: float
+    # Requested new quota.
+    requested_epsilon: float
+    requested_delta: float
+    # Live quota in effect just after the attempt (unchanged on rejection).
+    epsilon_after: float
+    delta_after: float
+    allowed: bool
+    status: Literal["adjusted", "rejected"]
+    reason: Optional[str] = None
+    epsilon_cap: float
+    # Composed epsilon occupied by granted requests + non-expired
+    # reservations before the attempt and with the new quota in place.
+    epsilon_committed_before: float
+    epsilon_committed_after: float
+    epsilon_remaining: float
+    rdp_best_order: float
+    idempotent_replay: bool = False
+    created_at: datetime
+
+
 class ForecastSnapshot(BaseModel):
     """Budget state for one set of still-valid reservations.
 

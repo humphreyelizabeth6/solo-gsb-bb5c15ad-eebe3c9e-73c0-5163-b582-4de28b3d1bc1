@@ -22,6 +22,7 @@ from .schemas import (
     RepeatRunWorkloadItem,
     ReversalCreate,
     ReversalPlanRequest,
+    ReservationAdjustmentCreate,
     ReservationConfirm,
     ReservationCreate,
     ReservationRenewalCreate,
@@ -778,10 +779,13 @@ async def create_reservation(
                     conn, dataset_id, payload.reservation_id
                 )
                 if existing is not None:
-                    # Idempotent replay: same reservation_id, same payload.
+                    # Idempotent replay: same reservation_id, same *creation*
+                    # payload.  A later quota adjustment rewrites the live
+                    # epsilon/delta, so the creation-time original_* columns
+                    # are the authority here.
                     same = (
-                        existing["epsilon"] == payload.epsilon
-                        and existing["delta"] == payload.delta
+                        existing["original_epsilon"] == payload.epsilon
+                        and existing["original_delta"] == payload.delta
                         and existing["ttl_seconds"] == payload.ttl_seconds
                     )
                     if not same:
@@ -1118,6 +1122,199 @@ async def renew_reservation(
                 conn, dataset_id, payload.renewal_id
             )
             return _renewal_view_from_row(renewal_row, replay=False), 201
+
+
+# ------------------------------------------------------------- adjustments --
+
+
+def _adjustment_view_from_row(
+    row: aiosqlite.Row, *, replay: bool
+) -> dict[str, Any]:
+    return {
+        "adjustment_id": row["adjustment_id"],
+        "dataset_id": row["dataset_id"],
+        "reservation_id": row["reservation_id"],
+        "epsilon_before": row["epsilon_before"],
+        "delta_before": row["delta_before"],
+        "requested_epsilon": row["requested_epsilon"],
+        "requested_delta": row["requested_delta"],
+        "epsilon_after": row["epsilon_after"],
+        "delta_after": row["delta_after"],
+        "allowed": row["status"] == "adjusted",
+        "status": row["status"],
+        "reason": row["reason"],
+        "epsilon_cap": row["epsilon_cap"],
+        "epsilon_committed_before": row["epsilon_committed_before"],
+        "epsilon_committed_after": row["epsilon_committed_after"],
+        "epsilon_remaining": max(
+            0.0, row["epsilon_cap"] - row["epsilon_committed_after"]
+        ),
+        "rdp_best_order": row["rdp_best_order"],
+        "idempotent_replay": replay,
+        "created_at": row["created_at"],
+    }
+
+
+async def adjust_reservation(
+    dataset_id: str,
+    reservation_id: str,
+    payload: ReservationAdjustmentCreate,
+) -> tuple[dict[str, Any], int]:
+    """Replace a granted, non-expired reservation's epsilon/delta quota.
+
+    The state check, the RDP feasibility projection, the reservation-row
+    rewrite and the immutable adjustment record all happen in one
+    ``BEGIN IMMEDIATE`` transaction, so an adjustment can never race a
+    confirm / release / expiry sweep into an inconsistent state.  The
+    committed occupancy is composed from the non-reversed granted requests,
+    the *other* non-expired granted reservations and the new quota under the
+    existing RDP rules.  When the projection stays within the dataset's
+    epsilon cap the live quota is replaced; otherwise the attempt is rejected
+    and recorded while the reservation keeps its original epsilon/delta.
+
+    Replaying the same ``(dataset_id, adjustment_id)`` with the same payload
+    (same reservation, epsilon and delta) returns the stored first verdict
+    with its quota snapshots (HTTP 200); a different payload on that id is a
+    409, as is a *new* adjustment on an expired or terminal reservation.  The
+    original reservation-creation replay is unaffected: it keeps matching the
+    creation-time payload even after a successful adjustment.
+    """
+    now_iso = utcnow().isoformat()
+
+    async with _write_lock():
+        async with db.connect() as conn:
+            await db.begin_immediate(conn)
+            try:
+                # Idempotency key first, so a retry replays the original
+                # record even when the reservation has since expired.
+                existing = await db.get_reservation_adjustment(
+                    conn, dataset_id, payload.adjustment_id
+                )
+                if existing is not None:
+                    same = (
+                        existing["reservation_id"] == reservation_id
+                        and existing["requested_epsilon"] == payload.epsilon
+                        and existing["requested_delta"] == payload.delta
+                    )
+                    if not same:
+                        raise db.AdjustmentConflict(payload.adjustment_id)
+                    view = _adjustment_view_from_row(existing, replay=True)
+                    await conn.commit()
+                    return view, 200
+
+                dataset = await db.require_dataset(conn, dataset_id)
+                row = await db.get_reservation(conn, dataset_id, reservation_id)
+                if row is None:
+                    raise db.ReservationNotFound(reservation_id)
+                row = await _refresh_reservation_row(conn, row, now_iso)
+                if row["status"] != "granted":
+                    raise db.ReservationStateConflict(
+                        f"reservation_{row['status']}",
+                        f"reservation is {row['status']} and its quota cannot "
+                        "be adjusted",
+                    )
+
+                # Committed occupancy including this reservation's current
+                # live quota; the lazy expiry sweep runs inside the tx.
+                entries = await _committed_entries(conn, dataset_id, now_iso)
+                _, committed_before, order_before = rdp.evaluate_entries(
+                    entries, dataset["delta_cap"]
+                )
+                committed_before = max(0.0, committed_before)
+
+                # Swap exactly this reservation's entry for the requested new
+                # quota and recompose under the same RDP accounting.  RDP
+                # composition is order-independent, so position does not
+                # matter.  ``entries`` already contains the reservation's
+                # current entry (the lazy sweep above only removed expired
+                # rows); duplicate (eps, delta) entries from other
+                # reservations are left untouched.
+                old_quota = (row["epsilon"], row["delta"])
+                swapped = list(entries)
+                for idx, entry in enumerate(swapped):
+                    if entry == old_quota:
+                        swapped[idx] = (payload.epsilon, payload.delta)
+                        break
+                else:  # Defensive: active set and row state diverged.
+                    swapped.append((payload.epsilon, payload.delta))
+                _, committed_after, order_after = rdp.evaluate_entries(
+                    swapped, dataset["delta_cap"]
+                )
+                committed_after = max(0.0, committed_after)
+
+                # Occupancy with this reservation itself removed, used to
+                # refresh the reservation row's epsilon_before snapshot.
+                others = list(entries)
+                try:
+                    others.remove(old_quota)
+                except ValueError:
+                    others = [e for e in entries if e != old_quota]
+                _, without_self, _ = rdp.evaluate_entries(
+                    others, dataset["delta_cap"]
+                )
+                without_self = max(0.0, without_self)
+
+                cap = dataset["epsilon_cap"]
+                old_epsilon = row["epsilon"]
+                old_delta = row["delta"]
+                if committed_after <= cap + settings.epsilon_tolerance:
+                    status = "adjusted"
+                    reason: Optional[str] = None
+                    final_epsilon = payload.epsilon
+                    final_delta = payload.delta
+                    order_used = order_after
+                    await db.adjust_reservation_quota(
+                        conn,
+                        dataset_id=dataset_id,
+                        reservation_id=reservation_id,
+                        epsilon=payload.epsilon,
+                        delta=payload.delta,
+                        epsilon_before=without_self,
+                        epsilon_after=committed_after,
+                        rdp_best_order=order_after,
+                    )
+                else:
+                    status = "rejected"
+                    reason = (
+                        f"adjustment rejected: projected epsilon "
+                        f"{committed_after:.6g} would surpass cap {cap:.6g} "
+                        f"(committed {committed_before:.6g}); reservation "
+                        "quota unchanged"
+                    )
+                    # A rejected adjustment moves nothing.
+                    final_epsilon = old_epsilon
+                    final_delta = old_delta
+                    committed_after = committed_before
+                    order_used = order_before
+
+                await db.insert_reservation_adjustment(
+                    conn,
+                    dataset_id=dataset_id,
+                    reservation_id=reservation_id,
+                    adjustment_id=payload.adjustment_id,
+                    epsilon_before=old_epsilon,
+                    delta_before=old_delta,
+                    requested_epsilon=payload.epsilon,
+                    requested_delta=payload.delta,
+                    epsilon_after=final_epsilon,
+                    delta_after=final_delta,
+                    status=status,
+                    reason=reason,
+                    epsilon_cap=cap,
+                    epsilon_committed_before=committed_before,
+                    epsilon_committed_after=committed_after,
+                    rdp_best_order=order_used,
+                    created_at=now_iso,
+                )
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+
+            stored = await db.get_reservation_adjustment(
+                conn, dataset_id, payload.adjustment_id
+            )
+            return _adjustment_view_from_row(stored, replay=False), 201
 
 
 async def get_reservation(dataset_id: str, reservation_id: str) -> dict[str, Any]:

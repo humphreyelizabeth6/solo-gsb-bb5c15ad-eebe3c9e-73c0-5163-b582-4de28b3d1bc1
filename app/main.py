@@ -27,6 +27,8 @@ from .schemas import (
     ReversalPlanRequest,
     ReversalPlanView,
     ReversalView,
+    ReservationAdjustmentCreate,
+    ReservationAdjustmentView,
     ReservationConfirm,
     ReservationCreate,
     ReservationList,
@@ -96,7 +98,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Differential-Privacy Budget Ledger",
-    version="1.10.0",
+    version="1.11.0",
     lifespan=lifespan,
     description=(
         "Register epsilon/delta caps per dataset and submit analysis "
@@ -117,7 +119,17 @@ app = FastAPI(
         "one write transaction that stores an immutable renewal record, "
         "leaving the reserved amount and original ttl_seconds unchanged and "
         "occupying no extra budget; same-payload replays return the first "
-        "renewal's before/after expiry instants.  A read-only release "
+        "renewal's before/after expiry instants.  A granted, not-yet-expired "
+        "reservation can additionally have its reserved quota adjusted: a "
+        "dataset-unique adjustment_id and new legal epsilon/delta values "
+        "replace the old quota in one write transaction, recomposed under the "
+        "same RDP rules with the non-reversed granted requests and every other "
+        "valid reservation; an over-cap projection is rejected, recorded and "
+        "leaves the quota unchanged, same-payload replays return the first "
+        "verdict with its quota snapshots while a different payload is a 409, "
+        "and confirmations, budget queries and release forecasts afterwards "
+        "use the new quota (the original reservation-creation replay still "
+        "matches the creation-time payload).  A read-only release "
         "forecast simulates future TTL expiries up to a "
         "caller-supplied UTC deadline without changing any reservation or "
         "database state.  Epsilon cap can also be transferred between two "
@@ -249,6 +261,23 @@ async def _renewal_conflict(_: Request, exc: db.RenewalConflict) -> JSONResponse
             "detail": (
                 "renewal_id was already used for a different renewal payload "
                 "(reservation or extend_seconds differs)"
+            ),
+        },
+    )
+
+
+@app.exception_handler(db.AdjustmentConflict)
+async def _adjustment_conflict(
+    _: Request, exc: db.AdjustmentConflict
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content={
+            "error": "adjustment_id_conflict",
+            "adjustment_id": exc.args[0],
+            "detail": (
+                "adjustment_id was already used for a different adjustment "
+                "payload (reservation, epsilon or delta differs)"
             ),
         },
     )
@@ -618,6 +647,25 @@ async def create_reservation_renewal(
     payload: ReservationRenewalCreate,
 ):
     view, http_status = await ledger.renew_reservation(
+        dataset_id, reservation_id, payload
+    )
+    return JSONResponse(status_code=http_status, content=view)
+
+
+@app.post(
+    "/datasets/{dataset_id}/reservations/{reservation_id}/adjustments",
+    response_model=ReservationAdjustmentView,
+    status_code=status.HTTP_201_CREATED,
+    tags=["reservations"],
+    summary="Adjust a granted reservation's epsilon/delta quota "
+    "(idempotent per adjustment_id)",
+)
+async def create_reservation_adjustment(
+    dataset_id: DATASET_ID,
+    reservation_id: RESERVATION_ID,
+    payload: ReservationAdjustmentCreate,
+):
+    view, http_status = await ledger.adjust_reservation(
         dataset_id, reservation_id, payload
     )
     return JSONResponse(status_code=http_status, content=view)
